@@ -92,7 +92,9 @@ Required when `airtableFieldType: "linkedRecord"`. Describes how to resolve and 
 | `lookup.fieldId` | yes | Field ID in the linked table to match against |
 | `lookup.rallyValue` | yes | `(r) => value` — returns the lookup key from the Rally record |
 | `createIfMissing` | no | If omitted, unmatched lookups return `null` and the field is cleared (or skipped if `nullHandling.rallyNull: "ignore"`). If provided, a new linked record is created with the specified fields when no match is found. |
-| `createIfMissing.fields` | yes (if `createIfMissing` present) | Object mapping field IDs to `(r) => value` functions used to populate the new record |
+| `createIfMissing.fields` | yes (if `createIfMissing` present) | Object mapping field IDs to value functions. Each function receives `(rallyRecord, details)` where `details` is the fetched Rally object (or `null` if `fetchRallyDetails` is not set or the fetch failed). Single-argument functions `(r) => ...` work unchanged. |
+| `createIfMissing.fetchRallyDetails` | no | `(r) => _ref` — returns the Rally `_ref` URL of the nested object to fetch additional fields for (e.g. `(r) => r.Owner?._ref`). Called lazily — only when the linked record is not found in Airtable and a new one needs to be created. Results are cached by `_ref`, so the same nested object is only fetched once per sync run. |
+| `createIfMissing.fetchRallyDetailFields` | no | Array of field names to fetch from the Rally object (e.g. `["DisplayName", "EmailAddress"]`). Omit to fetch all fields (`?fetch=true`). Only used when `fetchRallyDetails` is set. |
 
 `richText` automatically converts Rally's HTML to Markdown when writing to Airtable. Pair it with `rallyFieldType: "html"` on the same mapping to convert Markdown back to HTML when writing to Rally.
 
@@ -167,6 +169,34 @@ When compare.js processes records from more than one Rally artifact type (e.g. F
 ```
 
 Fields that exist on only one type will simply be `null` for records of the other type — `nullHandling: { rallyNull: "ignore" }` prevents those from overwriting existing Airtable values.
+
+#### Walk a nested sub-object (e.g. Project.Parent)
+
+Nested Rally objects (like `Project`) are trimmed to identity fields, but their own Rally sub-object references (like `Project.Parent`) are also preserved one level deep. This means you can inspect a parent project without a separate Rally API call:
+
+```js
+// Derive an ART name from the project or its parent
+{
+  rallyField: (r) => {
+    const project = r.Project?._refObjectName ?? r.Project?.Name ?? "";
+    const parent  = r.Project?.Parent?._refObjectName ?? r.Project?.Parent?.Name ?? "";
+    const artName = /\bART\b/i.test(project) ? project
+                  : /\bART\b/i.test(parent)  ? parent
+                  : "";
+    const name = artName.toLowerCase();
+    if (name.includes("pay"))     return "Digital Payments";
+    if (name.includes("account")) return "Account Servicing";
+    if (name.includes("engage"))  return "PEFE";
+    return null;
+  },
+  airtableFieldId: "fldXXXXXXXXXXXXXX",
+  airtableFieldType: "singleSelect",
+  direction: "toAirtable",
+  nullHandling: { rallyNull: "writeNull", airtableNull: "ignore" },
+},
+```
+
+`Project.Parent` is available automatically — no extra Rally API call or `fetchRallyDetails` needed. Only the identity fields (`ObjectID`, `Name`, `_refObjectName`, `_ref`, `_type`) are preserved on sub-objects; deeper nesting (e.g. `Project.Parent.Parent`) is not available.
 
 ---
 
@@ -272,7 +302,9 @@ Fields that exist on only one type will simply be `null` for records of the othe
 },
 ```
 
-#### Example 5: Owner linked record with lookup by email
+#### Example 5: Owner linked record with lazy Rally detail fetch
+
+The main Rally query only returns a slim set of fields for nested objects like `Owner` (`DisplayName`, `EmailAddress`, `ObjectID`, etc.). If your `createIfMissing` needs fields that weren't included in the main query, use `fetchRallyDetails` to fetch the full Rally object — but only when a new linked record actually needs to be created.
 
 ```js
 {
@@ -288,9 +320,11 @@ Fields that exist on only one type will simply be `null` for records of the othe
       rallyValue: (r) => r.Owner?.EmailAddress,
     },
     createIfMissing: {
+      fetchRallyDetails: (r) => r.Owner?._ref,                        // fetch full Owner object from Rally
+      fetchRallyDetailFields: ["DisplayName", "EmailAddress"],         // optional — omit to fetch all fields
       fields: {
-        "fldNAMEXXXXXXXXXX":  (r) => r.Owner?.DisplayName,
-        "fldEMAILXXXXXXXXXX": (r) => r.Owner?.EmailAddress,
+        "fldNAMEXXXXXXXXXX":  (r, details) => details?.DisplayName  ?? r.Owner?.DisplayName,
+        "fldEMAILXXXXXXXXXX": (r, details) => details?.EmailAddress ?? r.Owner?.EmailAddress,
       },
     },
   },
@@ -300,6 +334,8 @@ Fields that exist on only one type will simply be `null` for records of the othe
   },
 },
 ```
+
+`fetchRallyDetails` is only called when the Owner does not already exist in the linked Airtable table. If the Owner is found, no extra Rally API call is made. Results are cached by `_ref` — if multiple records share the same missing Owner, the Rally fetch happens only once.
 
 #### Example 6: Rich text description with HTML↔Markdown conversion
 

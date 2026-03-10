@@ -562,6 +562,32 @@ async function resolveConflict(rallyVal, airtableVal, mapping, rallyRecord, airt
 // Cache: linkedRecordCache[tableId][fieldId][lookupValue] = airtableRecordId
 const linkedRecordCache = {};
 
+// Cache: rallyDetailsCache[ref] = fetched Rally object details (or null on error)
+const rallyDetailsCache = {};
+
+async function fetchRallyDetails(ref, fields = []) {
+  if (!ref) return null;
+  if (rallyDetailsCache[ref] !== undefined) return rallyDetailsCache[ref];
+
+  try {
+    const fetchParam = fields.length > 0 ? fields.join(",") : "true";
+    const response = await fetch(`${ref}?fetch=${fetchParam}`, {
+      headers: { "ZSESSIONID": CONFIG.rally.apiKey },
+    });
+    if (!response.ok) {
+      log(`[fetchRallyDetails] Rally fetch failed for ${ref}: ${response.status}`, "error");
+      return (rallyDetailsCache[ref] = null);
+    }
+    const json = await response.json();
+    // Rally single-object endpoint returns { [TypeName]: { ...fields } }
+    const details = Object.values(json).find(v => v && typeof v === "object" && !Array.isArray(v)) ?? null;
+    return (rallyDetailsCache[ref] = details);
+  } catch (err) {
+    log(`[fetchRallyDetails] Error for ${ref}: ${err.message}`, "error");
+    return (rallyDetailsCache[ref] = null);
+  }
+}
+
 async function resolveLinkedRecordId(linkedTableId, lookupFieldId, lookupValue, createConfig, rallyRecord) {
   if (lookupValue === null || lookupValue === undefined) return null;
 
@@ -591,9 +617,14 @@ async function resolveLinkedRecordId(linkedTableId, lookupFieldId, lookupValue, 
 
   // Not found — create if configured
   if (createConfig && !CONFIG.dryRun) {
+    let details = null;
+    if (createConfig.fetchRallyDetails) {
+      const ref = createConfig.fetchRallyDetails(rallyRecord);
+      if (ref) details = await fetchRallyDetails(ref, createConfig.fetchRallyDetailFields ?? []);
+    }
     const fieldsToWrite = {};
     for (const [fieldId, valueFn] of Object.entries(createConfig.fields)) {
-      const val = typeof valueFn === "function" ? valueFn(rallyRecord) : valueFn;
+      const val = typeof valueFn === "function" ? valueFn(rallyRecord, details) : valueFn;
       if (val !== null && val !== undefined) fieldsToWrite[fieldId] = val;
     }
     const newId = await linkedTable.createRecordAsync(fieldsToWrite);

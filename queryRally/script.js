@@ -216,6 +216,30 @@ function buildProjectFilterGroup(projectIds) {
 // Collapses nested Rally object references to identifying fields only,
 // keeping the output payload small enough for Airtable's output.set() limit.
 
+const SLIM_FIELDS = ["ObjectID", "Name", "DisplayName", "FormattedID", "EmailAddress", "_type", "_refObjectName", "_ref"];
+
+// Slims a Rally object reference to identifying fields only.
+// Also preserves one level of nested Rally sub-objects (e.g. Project.Parent),
+// so extractor functions in compare.js can read r.Project?.Parent?._refObjectName
+// without a separate Rally API call.
+function slimRallyObject(value) {
+  const slim = {};
+  for (const f of SLIM_FIELDS) {
+    if (value[f] !== undefined) slim[f] = value[f];
+  }
+  for (const [k, v] of Object.entries(value)) {
+    if (slim[k] !== undefined) continue; // already captured above
+    if (v && typeof v === "object" && !Array.isArray(v) && (v._ref !== undefined || v._type !== undefined)) {
+      const nestedSlim = {};
+      for (const f of SLIM_FIELDS) {
+        if (v[f] !== undefined) nestedSlim[f] = v[f];
+      }
+      slim[k] = nestedSlim;
+    }
+  }
+  return slim;
+}
+
 function trimRecord(record) {
   const result = {};
   for (const [key, value] of Object.entries(record)) {
@@ -225,12 +249,7 @@ function trimRecord(record) {
       // Tags collection — preserve the name array used by compare.js
       result[key] = { Count: value.Count, _tagsNameArray: value._tagsNameArray };
     } else if (value._ref !== undefined || value._type !== undefined) {
-      // Rally object reference — keep only identifying fields
-      const slim = {};
-      for (const f of ["ObjectID", "Name", "DisplayName", "FormattedID", "EmailAddress", "_type"]) {
-        if (value[f] !== undefined) slim[f] = value[f];
-      }
-      result[key] = slim;
+      result[key] = slimRallyObject(value);
     } else {
       result[key] = value;
     }

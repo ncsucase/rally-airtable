@@ -233,6 +233,8 @@ Multiple entries are applied left-to-right (primary sort first). Rally applies o
 
 Only request fields that compare.js actually reads. Requesting extra fields slows the query and increases output size.
 
+> **Note:** Nested Rally objects in the `fetch` list (e.g. `Owner`, `Project`, `Iteration`) are trimmed to identity fields (`ObjectID`, `Name`, `DisplayName`, `_refObjectName`, `_ref`, etc.) to keep the output payload small. Sub-objects one level deep (e.g. `Project.Parent`) are also preserved as slimmed objects, so extractor functions in compare.js can read `r.Project?.Parent?._refObjectName` without a separate Rally API call. If you need fields beyond what the slim set provides, use `fetchRallyDetails` in a `createIfMissing` config — see the compare README.
+
 ```js
 fetch: [
   "FormattedID",
