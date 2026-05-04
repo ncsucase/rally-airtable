@@ -25,6 +25,9 @@ const CONFIG = {
 
   airtable: {
     tableId: "tblXXXXXXXXXXXXXX",  // ID of the table to sync into
+    // baseId and apiKey are only needed if you use airtableFieldType: "attachment" mappings
+    // baseId: "appXXXXXXXXXXXXXX",  // base ID from your Airtable base URL
+    // apiKey: "patXXXXXXXXXXXXXX",  // personal access token with data.records:write + attachments:write scopes
   },
 
   recordMatch: {
@@ -67,10 +70,11 @@ Each entry in `fieldMappings` describes how one Rally field maps to one Airtable
 
 | Property | Required | Description |
 |---|---|---|
-| `rallyField` | yes | Dot-path string (`"Owner.DisplayName"`) or extractor function `(r) => ...` |
+| `rallyField` | yes* | Dot-path string (`"Owner.DisplayName"`) or extractor function `(r) => ...`. *Not used for `airtableFieldType: "attachment"` — use `rallySourceField` instead. |
+| `rallySourceField` | yes* | Dot-path to the Rally HTML field to extract images from. *Only used (and required) for `airtableFieldType: "attachment"`. |
 | `airtableFieldId` | yes | Airtable field ID |
 | `airtableFieldType` | yes | Airtable field type (see types below) |
-| `direction` | yes | `"toAirtable"` \| `"toRally"` \| `"both"` |
+| `direction` | yes | `"toAirtable"` \| `"toRally"` \| `"both"`. Must be `"toAirtable"` for `attachment` mappings. |
 | `sourceOfTruth` | no | Conflict resolution config (required when `direction: "both"`) |
 | `transform` | no | `{ toAirtable: fn, toRally: fn }` — value transform functions |
 | `matchMode` | no | `"exact"` (default) \| `"includes"` \| `"splitOwnership"` |
@@ -80,7 +84,7 @@ Each entry in `fieldMappings` describes how one Rally field maps to one Airtable
 | `rallyFieldType` | no | Type hint for Rally write coercion. Supported values: `"date"`, `"dateTime"`, `"tags"`, `"ref"`, `"boolean"`, `"number"`, `"html"` |
 | `compareNormalize` | no | `(v) => normalizedV` — applied to both sides before comparison. Use when Rally and Airtable store the same data in different formats (e.g. HTML vs plain text). Applied after the built-in `richText` normalization. |
 
-**Supported `airtableFieldType` values:** `singleLineText`, `multilineText`, `richText`, `email`, `url`, `phoneNumber`, `number`, `currency`, `percent`, `rating`, `duration`, `checkbox`, `date`, `dateTime`, `singleSelect`, `multipleSelect`, `linkedRecord`
+**Supported `airtableFieldType` values:** `singleLineText`, `multilineText`, `richText`, `email`, `url`, `phoneNumber`, `number`, `currency`, `percent`, `rating`, `duration`, `checkbox`, `date`, `dateTime`, `singleSelect`, `multipleSelect`, `linkedRecord`, `attachment`
 
 #### linkedRecord config
 
@@ -354,9 +358,13 @@ Rally stores rich text fields (e.g. `Description` on Features) as HTML. Airtable
 },
 ```
 
+When a Rally rich-text field contains inline images, `htmlToMarkdown` replaces each `<img>` tag with a `[Image: filename.png]` placeholder at the exact position where the image appeared. This preserves context in the Airtable richText field and the filename matches the corresponding entry in the Attachments field (see Example 8).
+
 To inspect the conversion output without changing your `dryRun` setting, enable `diagnostics.logConversions` in CONFIG. The Airtable script console will print the input and converted output for every field processed with `richText` or `html` coercion.
 
 #### Example 7: Plain text with URLs → HTML links in Rally, stable comparison
+
+
 
 When an Airtable formula field produces plain text containing URLs, use `transform.toRally` to autolink them for Rally and `compareNormalize` to strip HTML from Rally's stored value so comparison stays in plain text on both sides.
 
@@ -376,3 +384,26 @@ When an Airtable formula field produces plain text containing URLs, use `transfo
   nullHandling: { rallyNull: "ignore", airtableNull: "writeNull" },
 },
 ```
+
+#### Example 8: Extract inline images from a Rally HTML field into an Airtable Attachments field
+
+Rally rich-text fields (e.g. `Description`) can contain inline images. Airtable's long-text field cannot display them, but a dedicated **Attachments** field can. Use `airtableFieldType: "attachment"` to extract images from the HTML, download them using your Rally API key, and upload them to Airtable.
+
+Requires `CONFIG.airtable.baseId` and `CONFIG.airtable.apiKey` to be set.
+
+```js
+{
+  rallySourceField:  "Description",        // Rally HTML field to extract images from
+  airtableFieldId:   "fldIMAGESXXXXXXXX", // must be an Attachments-type field in Airtable
+  airtableFieldType: "attachment",
+  direction:         "toAirtable",
+},
+```
+
+- Images are fetched from Rally using your Rally API key, so private/authenticated Rally images are supported.
+- Each image is uploaded to Airtable via the Content API using your Airtable personal access token.
+- Already-uploaded images (matched by filename) are skipped on subsequent sync runs — uploads are idempotent.
+- When paired with a `richText` mapping for the same source field (Example 6), the Description field in Airtable will contain `[Image: filename.png]` at the position where each image appeared, so users can cross-reference the Attachments field.
+- Multiple `attachment` mappings can share the same `airtableFieldId` to merge images from several HTML fields (e.g. Description and Notes) into one Attachments field.
+
+> **Airtable field setup:** The target field must be an **Attachments** field type (not Long text). Create it via **+ Add field → Attachments** in Airtable.

@@ -1,6 +1,6 @@
 # auditRecord
 
-Paste `auditRecord/script.js` into the "Run a script" action inside a Repeating Group. For each Airtable record passed in, the script queries Rally to determine the record's current status and stamps the result back to Airtable.
+Paste `auditRecord/script.js` into the "Run a script" action inside a Repeating Group. For each Airtable record passed in, the script queries Rally to determine the record's current status, stamps the result back to Airtable, and — optionally — writes Rally field values to additional Airtable fields in the same pass.
 
 **Automation order:**
 1. **Trigger** — scheduled or manual
@@ -34,6 +34,12 @@ Three-state mode requires additional CONFIG (see [Binary vs three-state mode](#b
 ```
 CONFIG.project    Project scope for the "in-scope" check — must match queryRally settings
 CONFIG.filters    Filters for the "in-scope" check — must match queryRally settings
+```
+
+Field enrichment is optional (see [Field enrichment](#field-enrichment)):
+
+```
+CONFIG.fieldMappings    Rally fields to fetch and write to Airtable alongside the status stamp
 ```
 
 ## Binary vs three-state mode
@@ -76,7 +82,126 @@ Set any value to `null` to skip updating records in that bucket. All values used
 
 `CONFIG.project` and `CONFIG.filters` must match the values used in `queryRally/script.js` for this table.
 
-## Record Types
+## Field enrichment
+
+`fieldMappings` is an optional array of Rally→Airtable field mappings. When present, the fields listed are fetched from Rally during the same API call used for the existence check — no additional Rally calls are made. Enrichment fields are written for **current** and **outOfScope** records (any time a Rally record is found); no enrichment is written for **gone** records.
+
+```js
+fieldMappings: [
+  { rallyField: "Name",              airtableFieldId: "fldXXX", airtableFieldType: "singleLineText" },
+  { rallyField: "Owner.DisplayName", airtableFieldId: "fldXXX", airtableFieldType: "singleLineText" },
+  { rallyField: "Description",       airtableFieldId: "fldXXX", airtableFieldType: "richText" },
+],
+```
+
+Omit `fieldMappings` entirely (or leave it as an empty array) to keep the script audit-only.
+
+### Mapping keys
+
+| Key | Required | Description |
+|---|---|---|
+| `rallyField` | yes | Dot-path string (`"Owner.DisplayName"`) or extractor function (`r => r.State?.Name`) |
+| `rallyFetch` | only if `rallyField` is a function | Top-level Rally field name to include in the `fetch=` request param |
+| `airtableFieldId` | yes | Target Airtable field ID |
+| `airtableFieldType` | yes | Airtable field type (see supported types below) |
+| `transform` | no | Function applied to the raw Rally value before writing, e.g. `v => v?.toUpperCase()` |
+| `nullHandling` | no | What to do when the Rally value is null — see [Null handling](#null-handling) |
+| `nullValue` | no | Fallback written when `nullHandling` is `"mapToValue"` |
+
+### Supported field types
+
+| `airtableFieldType` | Notes |
+|---|---|
+| `singleLineText` | |
+| `multilineText` | |
+| `url` | |
+| `email` | |
+| `phoneNumber` | |
+| `number` | |
+| `currency` | |
+| `percent` | |
+| `rating` | |
+| `checkbox` | |
+| `date` | Written as `YYYY-MM-DD` |
+| `dateTime` | Written as ISO 8601 |
+| `singleSelect` | Written as a plain string matching an existing option name |
+| `multipleSelect` | Written as an array of strings |
+| `richText` | Rally HTML is converted to Markdown — see [Rich text](#rich-text) |
+| `linkedRecord` | Resolved via lookup in a linked Airtable table — see [Linked records](#linked-records) |
+
+### Null handling
+
+Controls what happens when the Rally value resolves to `null`, `undefined`, or an empty array.
+
+| `nullHandling` value | Behavior |
+|---|---|
+| `"writeNull"` (default) | Clears the Airtable field |
+| `"ignore"` | Skips the field entirely — existing Airtable value is preserved |
+| `"mapToValue"` | Writes `nullValue` (or `null` if `nullValue` is not set) |
+
+### Rich text
+
+Rally stores rich text fields (e.g. `Description`, `Notes`) as HTML. Setting `airtableFieldType: "richText"` automatically converts the HTML to Markdown before writing. Supported conversions:
+
+- Bold, italic, inline code
+- Headings (h1–h6)
+- Ordered and unordered lists
+- Links
+- Code blocks (`<pre>`)
+- Tables (converted to Markdown pipe tables)
+- HTML entities (`&amp;`, `&lt;`, `&nbsp;`, etc.)
+- Images → `[Image: filename]` placeholder (inline images are not transferred)
+
+### Linked records
+
+Set `airtableFieldType: "linkedRecord"` to resolve a Rally value to a record in another Airtable table. Instead of writing the raw value, the script looks up a matching record in the linked table and writes its record ID.
+
+```js
+{
+  rallyField: "Owner.DisplayName",
+  airtableFieldId: "fldXXX",
+  airtableFieldType: "linkedRecord",
+  linkedRecord: {
+    linkedTableId: "tblXXX",
+    lookup: {
+      fieldId: "fldEMAILXXX",                    // field ID in the linked table to match against
+      rallyValue: r => r.Owner?.EmailAddress,     // how to extract the match key from the Rally record
+    },
+    createIfMissing: {                            // optional — omit to leave the field blank when no match
+      fields: {
+        "fldNAMEXXX":  r => r.Owner?.DisplayName,
+        "fldEMAILXXX": r => r.Owner?.EmailAddress,
+      },
+    },
+  },
+  nullHandling: "ignore",
+},
+```
+
+#### `linkedRecord` keys
+
+| Key | Required | Description |
+|---|---|---|
+| `linkedTableId` | yes | Airtable table ID to search |
+| `lookup.fieldId` | yes | Field ID in the linked table to match against |
+| `lookup.rallyValue` | yes | Function `(r) => value` that extracts the match key from the Rally record |
+| `createIfMissing` | no | If present, a new record is created in the linked table when no match is found |
+| `createIfMissing.fields` | yes (if `createIfMissing` is set) | Object mapping field IDs to extractor functions or static values; all values are written as strings |
+
+When `createIfMissing` is omitted and no match is found, `nullHandling` controls the outcome — `"ignore"` leaves the Airtable field unchanged, `"writeNull"` clears it.
+
+This field type is intentionally simpler than the equivalent in `compare/script.js`: no `direction` or `matchMode` (audit is always Rally→Airtable only), no cross-record lookup cache (the script runs one record at a time in a Repeating Group).
+
+### Function extractors
+
+Use a function when the value you need requires logic beyond dot-path traversal. Provide `rallyFetch` to name the top-level Rally field that should be included in the API request.
+
+```js
+{ rallyField: r => r.State?.Name,   rallyFetch: "State",   airtableFieldId: "fldXXX", airtableFieldType: "singleSelect" },
+{ rallyField: r => r.Tags?.map(t => t.Name), rallyFetch: "Tags", airtableFieldId: "fldXXX", airtableFieldType: "multipleSelect" },
+```
+
+## Record types
 
 `recordType` accepts a single string or an array of strings.
 
@@ -92,13 +217,14 @@ recordType: ["PortfolioItem/Feature", "HierarchicalRequirement"],
 |---|---|
 | User Story | `"HierarchicalRequirement"` |
 | Feature | `"PortfolioItem/Feature"` |
+| Epic / Initiative | `"PortfolioItem/Initiative"` |
 | Defect | `"Defect"` |
 | Task | `"Task"` |
 | Test Case | `"TestCase"` |
 
 When `recordType` is an array, each type is checked in order. The record is considered found as soon as any type returns a match.
 
-## Project Modes
+## Project modes
 
 Used only in three-state mode. Must match `queryRally/script.js` CONFIG.
 
@@ -157,24 +283,24 @@ filters: [
 
 ## Dry run
 
-Set `dryRun: true` to preview the audit without writing to Airtable. The script still queries Rally and logs the classification for each record.
+Set `dryRun: true` to preview the audit without writing to Airtable. The script still queries Rally and logs what would be written for each record.
 
 ## Console output
-
-Each record produces a single log line:
 
 ```
 Auditing F12345 (three-state mode)...
 Rally request: https://rally1.rallydev.com/...
-F12345 → current → no update (statusValue is null)
+F12345 → current → no update
 
 Auditing F99999 (three-state mode)...
 Rally request: https://rally1.rallydev.com/...
 Rally request: https://rally1.rallydev.com/...
-F99999 → outOfScope → set "Out of Scope"
+F99999 → outOfScope → updated 3 field(s)
 
 Auditing F00001 (three-state mode)...
 Rally request: https://rally1.rallydev.com/...
 Rally request: https://rally1.rallydev.com/...
-F00001 → gone → set "Removed from Rally"
+F00001 → gone → updated 1 field(s)
 ```
+
+With `dryRun: true`, writes are replaced with a log showing the full Airtable update object that would have been sent.

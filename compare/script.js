@@ -14,6 +14,8 @@ const CONFIG = {
 
   airtable: {
     tableId: "tblXXXXXXXXXXXXXX",
+    baseId:  "appXXXXXXXXXXXXXX",  // required for attachment uploads (from your Airtable base URL)
+    apiKey:  "patXXXXXXXXXXXXXX",  // PAT with data.records:write + attachments:write scopes
   },
 
   // How to match a Rally record to an Airtable record
@@ -257,6 +259,14 @@ function htmlToMarkdown(html) {
   s = s.replace(/<\/div>/gi, "\n");
   s = s.replace(/<\/blockquote>/gi, "\n");
 
+  // Convert <img> tags to named placeholders before stripping so position is preserved
+  s = s.replace(/<img[^>]+>/gi, imgTag => {
+    const alt = (imgTag.match(/alt=["']([^"']*?)["']/i) ?? [])[1];
+    const src = (imgTag.match(/src=["']([^"']+)["']/i) ?? [])[1] ?? "";
+    const name = alt?.trim() || src.split("/").pop().split("?")[0] || "image";
+    return `[Image: ${name}]`;
+  });
+
   // Strip all remaining HTML tags
   s = s.replace(/<[^>]+>/g, "");
 
@@ -271,6 +281,73 @@ function htmlToMarkdown(html) {
     console.log("[htmlToMarkdown] OUTPUT:", s);
   }
   return s;
+}
+
+function extractImagesFromHtml(html) {
+  if (!html) return [];
+  const seen = new Set();
+  const images = [];
+  const imgTags = html.match(/<img[^>]+>/gi) ?? [];
+  for (let i = 0; i < imgTags.length; i++) {
+    const tag = imgTags[i];
+    const srcMatch = tag.match(/src=["']([^"']+)["']/i);
+    if (!srcMatch) continue;
+    let src = srcMatch[1];
+    if (src.startsWith("//")) src = "https:" + src;
+    else if (src.startsWith("/")) src = "https://rally1.rallydev.com" + src;
+    if (seen.has(src)) continue;
+    seen.add(src);
+    const altMatch = tag.match(/alt=["']([^"']*?)["']/i);
+    const alt = altMatch?.[1]?.trim();
+    const urlName = src.split("/").pop().split("?")[0];
+    const ext = urlName.match(/\.[a-zA-Z0-9]{2,5}$/)?.[0] ?? ".png";
+    let filename;
+    if (alt) {
+      filename = alt.replace(/[^a-zA-Z0-9._-]/g, "_") + (alt.includes(".") ? "" : ext);
+    } else {
+      filename = urlName || `image_${i}${ext}`;
+    }
+    images.push({ src, filename });
+  }
+  return images;
+}
+
+async function fetchImageAsArrayBuffer(url) {
+  try {
+    const response = await fetch(url, { headers: { "ZSESSIONID": CONFIG.rally.apiKey } });
+    if (!response.ok) {
+      log(`Failed to fetch image ${url}: HTTP ${response.status}`, "error");
+      return null;
+    }
+    const buffer = await response.arrayBuffer();
+    const contentType = response.headers.get("content-type") ?? "application/octet-stream";
+    return { buffer, contentType };
+  } catch (err) {
+    log(`Error fetching image ${url}: ${err.message}`, "error");
+    return null;
+  }
+}
+
+async function uploadAttachmentToAirtable(recordId, fieldId, buffer, filename, contentType) {
+  try {
+    const url = `https://content.airtable.com/v0/${CONFIG.airtable.baseId}/${recordId}/${fieldId}/uploadAttachment`;
+    const form = new FormData();
+    form.append("file", new Blob([buffer], { type: contentType }), filename);
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${CONFIG.airtable.apiKey}` },
+      body: form,
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      log(`Failed to upload attachment ${filename}: HTTP ${response.status} — ${text}`, "error");
+      return false;
+    }
+    return true;
+  } catch (err) {
+    log(`Error uploading attachment ${filename}: ${err.message}`, "error");
+    return false;
+  }
 }
 
 function markdownToHtml(md) {
@@ -588,10 +665,10 @@ async function fetchRallyDetails(ref, fields = []) {
   }
 }
 
-async function resolveLinkedRecordId(linkedTableId, lookupFieldId, lookupValue, createConfig, rallyRecord) {
+async function resolveLinkedRecordId(linkedTableId, lookupFieldId, lookupValue, createConfig, rallyRecord, normalize = v => v) {
   if (lookupValue === null || lookupValue === undefined) return null;
 
-  const key = String(lookupValue);
+  const key = String(normalize(lookupValue));
 
   // Check cache
   linkedRecordCache[linkedTableId] ??= {};
@@ -607,7 +684,7 @@ async function resolveLinkedRecordId(linkedTableId, lookupFieldId, lookupValue, 
   });
 
   for (const record of results.records) {
-    const val = record.getCellValueAsString(lookupFieldId);
+    const val = normalize(record.getCellValueAsString(lookupFieldId));
     linkedRecordCache[linkedTableId][lookupFieldId][val] = record.id;
   }
 
@@ -695,6 +772,40 @@ async function updateRallyRecord(rallyRecord, fields) {
   return response.json();
 }
 
+// --- Attachment sync ---------------------------------------------------------
+
+async function syncAttachmentField(rallyRecord, airtableRecord, mapping) {
+  const html = getRallyValue(rallyRecord, mapping.rallySourceField);
+  if (!html) return;
+
+  const images = extractImagesFromHtml(html);
+  if (images.length === 0) return;
+
+  const existing = airtableRecord.getCellValue(mapping.airtableFieldId) ?? [];
+  const existingFilenames = new Set(existing.map(a => a.filename));
+
+  for (const { src, filename } of images) {
+    if (existingFilenames.has(filename)) {
+      log(`Attachment already present, skipping: ${filename}`);
+      continue;
+    }
+    const result = await fetchImageAsArrayBuffer(src);
+    if (!result) continue;
+    if (CONFIG.dryRun) {
+      log(`[DRY RUN] Would upload attachment: ${filename} to field ${mapping.airtableFieldId}`);
+      continue;
+    }
+    const ok = await uploadAttachmentToAirtable(
+      airtableRecord.id, mapping.airtableFieldId,
+      result.buffer, filename, result.contentType
+    );
+    if (ok) {
+      log(`Uploaded attachment: ${filename}`);
+      existingFilenames.add(filename);
+    }
+  }
+}
+
 // --- Main sync logic ---------------------------------------------------------
 
 async function syncRecord(rallyRecord, airtableRecord, isNewRecord) {
@@ -716,12 +827,14 @@ async function syncRecord(rallyRecord, airtableRecord, isNewRecord) {
       linkedRecord.lookup.fieldId,
       lookupValue,
       linkedRecord.createIfMissing ?? null,
-      rallyRecord
+      rallyRecord,
+      linkedRecord.lookup.normalize
     );
   }
 
   // ---- Per-mapping comparison and changeset building ----------------------
   for (const mapping of CONFIG.fieldMappings) {
+    if (mapping.airtableFieldType === "attachment") continue;
     try {
       // 1. Extract raw values
       let rawRally    = getRallyValue(rallyRecord, mapping.rallyField);
@@ -843,9 +956,10 @@ async function syncRecord(rallyRecord, airtableRecord, isNewRecord) {
           const lookupValue = mapping.linkedRecord.lookup.rallyValue
             ? getRallyValue(rallyRecord, mapping.linkedRecord.lookup.rallyValue)
             : winnerValue;
+          const lookupNormalize = mapping.linkedRecord.lookup.normalize ?? (v => v);
           const resolvedId = linkedRecordCache[mapping.linkedRecord.linkedTableId]
             ?.[mapping.linkedRecord.lookup.fieldId]
-            ?.[String(lookupValue)];
+            ?.[String(lookupNormalize(lookupValue))];
           coercedValue = coerceForAirtable(winnerValue, mapping.airtableFieldType, resolvedId ? [{ id: resolvedId }] : []);
         } else {
           coercedValue = coerceForAirtable(winnerValue, mapping.airtableFieldType, null);
@@ -960,6 +1074,18 @@ async function main() {
     }
   } else {
     log("No Airtable updates required");
+  }
+
+  // Attachment sync pass — runs after standard updates so the record always exists
+  if (airtableRecord) {
+    for (const mapping of CONFIG.fieldMappings) {
+      if (mapping.airtableFieldType !== "attachment") continue;
+      try {
+        await syncAttachmentField(rallyRecord, airtableRecord, mapping);
+      } catch (err) {
+        log(`Error syncing attachment field ${mapping.airtableFieldId}: ${err.message}`, "error");
+      }
+    }
   }
 
   // Apply Rally updates

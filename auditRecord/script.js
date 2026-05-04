@@ -64,6 +64,34 @@ const CONFIG = {
     // statusValue: "Inactive",
   },
 
+  // Optional — fetch Rally field values and write them to Airtable in the same pass.
+  // Only fields listed here are fetched; omit entirely to keep the script audit-only.
+  // Enrichment is written for "current" and "outOfScope" states (whenever a Rally record
+  // is found); no enrichment is written for "gone" records.
+  fieldMappings: [
+    // { rallyField: "Name",                airtableFieldId: "fldXXX", airtableFieldType: "singleLineText" },
+    // { rallyField: "Owner.DisplayName",   airtableFieldId: "fldXXX", airtableFieldType: "singleLineText" },
+    // { rallyField: r => r.State?.Name,    rallyFetch: "State",       airtableFieldId: "fldXXX", airtableFieldType: "singleSelect" },
+    // { rallyField: "Owner.DisplayName", airtableFieldId: "fldXXX", airtableFieldType: "linkedRecord",
+    //   linkedRecord: {
+    //     linkedTableId: "tblXXX",
+    //     lookup: { fieldId: "fldXXX", rallyValue: r => r.Owner?.EmailAddress },
+    //     createIfMissing: { fields: { "fldNAMEXXX": r => r.Owner?.DisplayName, "fldEMAILXXX": r => r.Owner?.EmailAddress } },
+    //   },
+    //   nullHandling: "ignore" },
+    //
+    // Optional per-mapping keys:
+    //   rallyFetch   — required only when rallyField is a function; names the top-level Rally field to request
+    //   transform    — function applied to the raw Rally value before writing, e.g. v => v?.toUpperCase()
+    //   nullHandling — "writeNull" (default) | "ignore" (skip if null) | "mapToValue" (write nullValue)
+    //   nullValue    — fallback written when nullHandling is "mapToValue"
+    //
+    // Supported airtableFieldType values:
+    //   singleLineText, multilineText, url, email, phoneNumber,
+    //   number, currency, percent, rating, checkbox,
+    //   date, dateTime, singleSelect, multipleSelect, richText, linkedRecord
+  ],
+
 }; // end CONFIG
 
 // --- Config normalization ----------------------------------------------------
@@ -91,6 +119,197 @@ const CONFIG = {
   if (!("statusCurrent"    in a)) a.statusCurrent    = null;
   a._threeState = (a.statusGone !== a.statusOutOfScope);
 })();
+
+// --- Field enrichment helpers ------------------------------------------------
+
+// Builds the Rally fetch= param from fieldMappings. Always includes FormattedID.
+function buildFetchParam() {
+  const base = ["FormattedID"];
+  if (!CONFIG.fieldMappings?.length) return base[0];
+  const extra = CONFIG.fieldMappings.map(m =>
+    typeof m.rallyField === "function" ? (m.rallyFetch ?? null) : m.rallyField.split(".")[0]
+  ).filter(Boolean);
+  return [...new Set([...base, ...extra])].join(",");
+}
+
+function getRallyValue(record, rallyField) {
+  if (typeof rallyField === "function") return rallyField(record);
+  return rallyField.split(".").reduce((obj, key) => obj?.[key] ?? null, record);
+}
+
+function coerceForAirtable(value, fieldType) {
+  if (value === null || value === undefined) return null;
+  switch (fieldType) {
+    case "singleLineText": case "multilineText":
+    case "url": case "email": case "phoneNumber":
+      return String(value);
+    case "number": case "currency": case "percent": case "rating":
+      return Number(value);
+    case "checkbox":
+      return Boolean(value);
+    case "date":
+      return new Date(value).toISOString().slice(0, 10);
+    case "dateTime":
+      return new Date(value).toISOString();
+    case "singleSelect":
+      return String(value);
+    case "multipleSelect":
+      return Array.isArray(value) ? value.map(String) : [String(value)];
+    case "richText":
+      return htmlToMarkdown(String(value));
+    default:
+      return String(value);
+  }
+}
+
+function applyNullHandling(value, mapping) {
+  const isNull = value === null || value === undefined || (Array.isArray(value) && value.length === 0);
+  if (!isNull) return value;
+  switch (mapping.nullHandling ?? "writeNull") {
+    case "ignore":     return undefined; // sentinel — caller skips this field
+    case "mapToValue": return mapping.nullValue ?? null;
+    case "writeNull":
+    default:           return null;
+  }
+}
+
+function decodeHtmlEntities(str) {
+  return str
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
+}
+
+function convertTableToMarkdown(tableHtml) {
+  let s = tableHtml;
+  s = s.replace(/<colgroup[^>]*>[\s\S]*?<\/colgroup>/gi, "");
+  s = s.replace(/<\/?(thead|tbody|tfoot)[^>]*>/gi, "");
+  const rowMatches = [...s.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)];
+  const rows = [];
+  for (const [, rowInner] of rowMatches) {
+    const cells = [];
+    for (const [, cellInner] of rowInner.matchAll(/<t[hd][^>]*>([\s\S]*?)<\/t[hd]>/gi)) {
+      cells.push(decodeHtmlEntities(cellInner.replace(/<[^>]+>/g, "")).trim());
+    }
+    if (cells.length > 0) rows.push(cells);
+  }
+  if (rows.length === 0) return "";
+  const colCount = Math.max(...rows.map(r => r.length));
+  const separator = "|" + Array(colCount).fill("---|").join("");
+  const mdRows = rows.map(cells => {
+    while (cells.length < colCount) cells.push("");
+    return "| " + cells.join(" | ") + " |";
+  });
+  mdRows.splice(1, 0, separator);
+  return "\n\n" + mdRows.join("\n") + "\n\n";
+}
+
+function htmlToMarkdown(html) {
+  if (!html) return "";
+  let s = html;
+  s = s.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "");
+  s = s.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "");
+  s = s.replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, (_, inner) => {
+    const code = inner.replace(/<code[^>]*>/gi, "").replace(/<\/code>/gi, "");
+    return "\n```\n" + decodeHtmlEntities(code.trim()) + "\n```\n";
+  });
+  s = s.replace(/<a[^>]+href=["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi, "[$2]($1)");
+  s = s.replace(/<strong[^>]*>([\s\S]*?)<\/strong>/gi, "**$1**");
+  s = s.replace(/<b[^>]*>([\s\S]*?)<\/b>/gi, "**$1**");
+  s = s.replace(/<em[^>]*>([\s\S]*?)<\/em>/gi, "*$1*");
+  s = s.replace(/<i[^>]*>([\s\S]*?)<\/i>/gi, "*$1*");
+  s = s.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, "`$1`");
+  s = s.replace(/<h1[^>]*>([\s\S]*?)<\/h1>/gi, "\n# $1\n");
+  s = s.replace(/<h2[^>]*>([\s\S]*?)<\/h2>/gi, "\n## $1\n");
+  s = s.replace(/<h3[^>]*>([\s\S]*?)<\/h3>/gi, "\n### $1\n");
+  s = s.replace(/<h4[^>]*>([\s\S]*?)<\/h4>/gi, "\n#### $1\n");
+  s = s.replace(/<h5[^>]*>([\s\S]*?)<\/h5>/gi, "\n##### $1\n");
+  s = s.replace(/<h6[^>]*>([\s\S]*?)<\/h6>/gi, "\n###### $1\n");
+  s = s.replace(/<ol[^>]*>([\s\S]*?)<\/ol>/gi, (_, inner) => {
+    let n = 0;
+    return inner.replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, (__, item) => `\n${++n}. ${item}`) + "\n";
+  });
+  s = s.replace(/<ul[^>]*>([\s\S]*?)<\/ul>/gi, (_, inner) =>
+    inner.replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, "\n- $1") + "\n"
+  );
+  s = s.replace(/<table[^>]*>([\s\S]*?)<\/table>/gi, (_, inner) => convertTableToMarkdown(inner));
+  s = s.replace(/<\/?figure[^>]*>/gi, "");
+  s = s.replace(/<br\s*\/?>/gi, "\n");
+  s = s.replace(/<\/p>/gi, "\n\n");
+  s = s.replace(/<\/div>/gi, "\n");
+  s = s.replace(/<\/blockquote>/gi, "\n");
+  s = s.replace(/<img[^>]+>/gi, imgTag => {
+    const alt = (imgTag.match(/alt=["']([^"']*?)["']/i) ?? [])[1];
+    const src = (imgTag.match(/src=["']([^"']+)["']/i) ?? [])[1] ?? "";
+    const name = alt?.trim() || src.split("/").pop().split("?")[0] || "image";
+    return `[Image: ${name}]`;
+  });
+  s = s.replace(/<[^>]+>/g, "");
+  s = decodeHtmlEntities(s);
+  return s.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+async function resolveLinkedRecord(rallyRecord, mapping) {
+  const { linkedRecord } = mapping;
+  const matchValue = typeof linkedRecord.lookup.rallyValue === "function"
+    ? linkedRecord.lookup.rallyValue(rallyRecord)
+    : getRallyValue(rallyRecord, linkedRecord.lookup.rallyValue);
+
+  if (matchValue === null || matchValue === undefined || matchValue === "") {
+    const nh = mapping.nullHandling ?? "writeNull";
+    if (nh === "ignore") return undefined;
+    if (nh === "mapToValue") return mapping.nullValue ?? null;
+    return null;
+  }
+
+  const matchStr = String(matchValue);
+  const table    = base.getTable(linkedRecord.linkedTableId);
+  const query    = await table.selectRecordsAsync({ fields: [linkedRecord.lookup.fieldId] });
+  const match    = query.records.find(
+    r => r.getCellValueAsString(linkedRecord.lookup.fieldId) === matchStr
+  );
+
+  if (match) return [{ id: match.id }];
+
+  if (linkedRecord.createIfMissing) {
+    const newFields = {};
+    for (const [fieldId, extractor] of Object.entries(linkedRecord.createIfMissing.fields ?? {})) {
+      const val = typeof extractor === "function" ? extractor(rallyRecord) : extractor;
+      if (val !== null && val !== undefined) newFields[fieldId] = String(val);
+    }
+    const newId = await table.createRecordAsync(newFields);
+    console.log(`  Created linked record: ${matchStr}`);
+    return [{ id: newId }];
+  }
+
+  const nh = mapping.nullHandling ?? "writeNull";
+  if (nh === "ignore") return undefined;
+  if (nh === "mapToValue") return mapping.nullValue ?? null;
+  return null;
+}
+
+async function buildEnrichmentUpdates(rallyRecord) {
+  if (!CONFIG.fieldMappings?.length || !rallyRecord) return {};
+  const updates = {};
+  for (const mapping of CONFIG.fieldMappings) {
+    if (mapping.airtableFieldType === "linkedRecord") {
+      const value = await resolveLinkedRecord(rallyRecord, mapping);
+      if (value === undefined) continue;
+      updates[mapping.airtableFieldId] = value;
+      continue;
+    }
+    const raw         = getRallyValue(rallyRecord, mapping.rallyField);
+    const transformed = mapping.transform ? mapping.transform(raw) : raw;
+    const handled     = applyNullHandling(transformed, mapping);
+    if (handled === undefined) continue;
+    updates[mapping.airtableFieldId] = coerceForAirtable(handled, mapping.airtableFieldType);
+  }
+  return updates;
+}
 
 // --- Query builder -----------------------------------------------------------
 
@@ -136,7 +355,8 @@ function buildCheckQuery(rallyId, extraFilter = null) {
   return query;
 }
 
-// Fires a single Rally request and returns true if any matching record exists.
+// Fires a single Rally request and returns { found, record } where record is the
+// first matching Rally object (populated per buildFetchParam) or null.
 // query       — pre-built WSAPI query string (not URL-encoded)
 // extraParams — optional { project, projectScopeDown } URL params
 async function checkExists(query, extraParams = {}) {
@@ -147,7 +367,7 @@ async function checkExists(query, extraParams = {}) {
     // does not decode percent-encoded query strings.
     const orderedParams = {
       query,
-      fetch: "FormattedID",
+      fetch: buildFetchParam(),
       project: null,
       projectScopeDown: null,
       ...extraParams,
@@ -167,10 +387,10 @@ async function checkExists(query, extraParams = {}) {
     const json = await response.json();
     const result = json.QueryResult;
     if (result.Errors?.length > 0) throw new Error(`Rally errors: ${result.Errors.join(", ")}`);
-    if ((result.TotalResultCount ?? 0) > 0) return true;
+    if ((result.TotalResultCount ?? 0) > 0) return { found: true, record: result.Results?.[0] ?? null };
   }
 
-  return false;
+  return { found: false, record: null };
 }
 
 // Checks if the record exists AND matches the configured project scope + filters.
@@ -200,13 +420,13 @@ async function checkInScope(rallyId) {
     } else {
       // scopeDown: use Rally's projectScopeDown param, one call per project ref.
       for (const projectRef of refs) {
-        const found = await checkExists(buildCheckQuery(rallyId), {
+        const result = await checkExists(buildCheckQuery(rallyId), {
           project: `${CONFIG.rally.baseUrl}${projectRef}`,
           projectScopeDown: "true",
         });
-        if (found) return true;
+        if (result.found) return result;
       }
-      return false;
+      return { found: false, record: null };
     }
 
   } else {
@@ -226,16 +446,19 @@ async function classifyRecord(rallyId) {
 
   if (!_threeState) {
     // Binary mode: single workspace-wide existence check.
-    const exists = await checkExistsAnywhere(rallyId);
-    return exists ? "current" : "gone";
+    const result = await checkExistsAnywhere(rallyId);
+    return { state: result.found ? "current" : "gone", record: result.record };
   }
 
   // Three-state mode: scoped check first (1 call), workspace-wide only if needed (1 call).
-  const inScope = await checkInScope(rallyId);
-  if (inScope) return "current";
+  const inScopeResult = await checkInScope(rallyId);
+  if (inScopeResult.found) return { state: "current", record: inScopeResult.record };
 
-  const existsAnywhere = await checkExistsAnywhere(rallyId);
-  return existsAnywhere ? "outOfScope" : "gone";
+  const anywhereResult = await checkExistsAnywhere(rallyId);
+  return {
+    state: anywhereResult.found ? "outOfScope" : "gone",
+    record: anywhereResult.record,
+  };
 }
 
 // --- Main --------------------------------------------------------------------
@@ -247,21 +470,24 @@ async function main() {
 
   console.log(`Auditing ${rallyId} (${_threeState ? "three-state" : "binary"} mode)...`);
 
-  const state = await classifyRecord(rallyId);
+  const { state, record } = await classifyRecord(rallyId);
   const statusValue = { current: statusCurrent, outOfScope: statusOutOfScope, gone: statusGone }[state];
 
-  if (statusValue) {
-    if (CONFIG.dryRun) {
-      console.log(`[DRY RUN] ${rallyId} → ${state} → would set "${statusValue}"`);
-    } else {
-      const table = base.getTable(CONFIG.airtable.tableId);
-      await table.updateRecordAsync(recordId, {
-        [CONFIG.airtable.statusFieldId]: { name: statusValue },
-      });
-      console.log(`${rallyId} → ${state} → set "${statusValue}"`);
-    }
+  const airtableUpdates = {};
+  if (statusValue) airtableUpdates[CONFIG.airtable.statusFieldId] = { name: statusValue };
+  Object.assign(airtableUpdates, await buildEnrichmentUpdates(record));
+
+  if (Object.keys(airtableUpdates).length === 0) {
+    console.log(`${rallyId} → ${state} → no update`);
+    return;
+  }
+
+  if (CONFIG.dryRun) {
+    console.log(`[DRY RUN] ${rallyId} → ${state} → would update: ${JSON.stringify(airtableUpdates)}`);
   } else {
-    console.log(`${rallyId} → ${state} → no update (statusValue is null)`);
+    const table = base.getTable(CONFIG.airtable.tableId);
+    await table.updateRecordAsync(recordId, airtableUpdates);
+    console.log(`${rallyId} → ${state} → updated ${Object.keys(airtableUpdates).length} field(s)`);
   }
 }
 
